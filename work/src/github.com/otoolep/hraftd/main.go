@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 
 	httpd "github.com/otoolep/hraftd/http"
 	"github.com/otoolep/hraftd/store"
@@ -26,6 +27,7 @@ var httpAddr string
 var raftAddr string
 var joinAddr string
 var nodeID string
+var shardIDs string
 
 func init() {
 	flag.BoolVar(&inmem, "inmem", false, "Use in-memory storage for Raft")
@@ -33,11 +35,13 @@ func init() {
 	flag.StringVar(&raftAddr, "raddr", DefaultRaftAddr, "Set Raft bind address")
 	flag.StringVar(&joinAddr, "join", "", "Set join address, if any")
 	flag.StringVar(&nodeID, "id", "", "Node ID. If not set, same as Raft bind address")
+	flag.StringVar(&shardIDs, "shards", "", "Comma-separated list of shard IDs")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <raft-data-path> \n", os.Args[0])
 		flag.PrintDefaults()
 	}
 }
+
 
 func main() {
 	flag.Parse()
@@ -45,7 +49,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "No Raft storage directory specified\n")
 		os.Exit(1)
 	}
-
 	if nodeID == "" {
 		nodeID = raftAddr
 	}
@@ -58,25 +61,30 @@ func main() {
 	if err := os.MkdirAll(raftDir, 0700); err != nil {
 		log.Fatalf("failed to create path for Raft storage: %s", err.Error())
 	}
+	
+    shards := strings.Split(shardIDs, ",")
+    if len(shards) == 0 || (len(shards) == 1 && shards[0] == "") {
+        log.Fatalln("No shards specified")
+    }
 
-	s := store.New(inmem)
-	s.RaftDir = raftDir
-	s.RaftBind = raftAddr
-	if err := s.Open(joinAddr == "", nodeID); err != nil {
-		log.Fatalf("failed to open store: %s", err.Error())
-	}
+    s := store.New(nodeID, inmem)
+    s.RaftDir = raftDir
+    s.RaftBind = raftAddr
+    if err := s.Open(joinAddr == "", nodeID, shards); err != nil {
+        log.Fatalf("failed to open store: %s", err.Error())
+    }
 
 	h := httpd.New(httpAddr, s)
 	if err := h.Start(); err != nil {
 		log.Fatalf("failed to start HTTP service: %s", err.Error())
 	}
-
-	// If join was specified, make the join request.
-	if joinAddr != "" {
-		if err := join(joinAddr, raftAddr, nodeID); err != nil {
-			log.Fatalf("failed to join node at %s: %s", joinAddr, err.Error())
-		}
-	}
+	
+    // If join was specified, make the join request with shards.
+    if joinAddr != "" {
+        if err := join(joinAddr, raftAddr, nodeID, shards); err != nil {
+            log.Fatalf("failed to join node at %s: %s", joinAddr, err.Error())
+        }
+    }
 
 	// We're up and running!
 	log.Printf("hraftd started successfully, listening on http://%s", httpAddr)
@@ -87,15 +95,22 @@ func main() {
 	log.Println("hraftd exiting")
 }
 
-func join(joinAddr, raftAddr, nodeID string) error {
-	b, err := json.Marshal(map[string]string{"addr": raftAddr, "id": nodeID})
-	if err != nil {
-		return err
-	}
-	resp, err := http.Post(fmt.Sprintf("http://%s/join", joinAddr), "application-type/json", bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	return nil
+func join(joinAddr, raftAddr, nodeID string, shards []string) error {
+    b, err := json.Marshal(map[string]interface{}{
+        "addr":   raftAddr,
+        "id":     nodeID,
+        "shards": shards,
+    })
+    if err != nil {
+        return err
+    }
+    resp, err := http.Post(fmt.Sprintf("http://%s/join", joinAddr), "application/json", bytes.NewReader(b))
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("join request failed with status code: %d", resp.StatusCode)
+    }
+    return nil
 }

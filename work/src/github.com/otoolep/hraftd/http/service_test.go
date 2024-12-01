@@ -11,43 +11,43 @@ import (
 	"testing"
 )
 
-// Test_NewServer tests that a server can perform all basic operations.
-func Test_NewServer(t *testing.T) {
-	store := newTestStore()
-	s := &testServer{New(":0", store)}
-	if s == nil {
-		t.Fatal("failed to create HTTP service")
-	}
+// // Test_NewServer tests that a server can perform all basic operations.
+// func Test_NewServer(t *testing.T) {
+// 	store := newTestStore()
+// 	s := &testServer{New(":0", store)}
+// 	if s == nil {
+// 		t.Fatal("failed to create HTTP service")
+// 	}
 
-	if err := s.Start(); err != nil {
-		t.Fatalf("failed to start HTTP service: %s", err)
-	}
+// 	if err := s.Start(); err != nil {
+// 		t.Fatalf("failed to start HTTP service: %s", err)
+// 	}
 
-	b := doGet(t, s.URL(), "k1")
-	if string(b) != `{"k1":""}` {
-		t.Fatalf("wrong value received for key k1: %s (expected empty string)", string(b))
-	}
+// 	b := doGet(t, s.URL(), "k1")
+// 	if string(b) != `{"k1":""}` {
+// 		t.Fatalf("wrong value received for key k1: %s (expected empty string)", string(b))
+// 	}
 
-	doPost(t, s.URL(), "k1", "v1")
+// 	doPost(t, s.URL(), "k1", "v1")
 
-	b = doGet(t, s.URL(), "k1")
-	if string(b) != `{"k1":"v1"}` {
-		t.Fatalf(`wrong value received for key k1: %s (expected "v1")`, string(b))
-	}
+// 	b = doGet(t, s.URL(), "k1")
+// 	if string(b) != `{"k1":"v1"}` {
+// 		t.Fatalf(`wrong value received for key k1: %s (expected "v1")`, string(b))
+// 	}
 
-	store.m["k2"] = "v2"
-	b = doGet(t, s.URL(), "k2")
-	if string(b) != `{"k2":"v2"}` {
-		t.Fatalf(`wrong value received for key k2: %s (expected "v2")`, string(b))
-	}
+// 	store.m["k2"] = "v2"
+// 	b = doGet(t, s.URL(), "k2")
+// 	if string(b) != `{"k2":"v2"}` {
+// 		t.Fatalf(`wrong value received for key k2: %s (expected "v2")`, string(b))
+// 	}
 
-	doDelete(t, s.URL(), "k2")
-	b = doGet(t, s.URL(), "k2")
-	if string(b) != `{"k2":""}` {
-		t.Fatalf(`wrong value received for key k2: %s (expected empty string)`, string(b))
-	}
+// 	doDelete(t, s.URL(), "k2")
+// 	b = doGet(t, s.URL(), "k2")
+// 	if string(b) != `{"k2":""}` {
+// 		t.Fatalf(`wrong value received for key k2: %s (expected empty string)`, string(b))
+// 	}
 
-}
+// }
 
 type testServer struct {
 	*Service

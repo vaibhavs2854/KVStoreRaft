@@ -17,9 +17,11 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"strconv"
 
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/otoolep/hraftd/consistenthash"
 )
 
 const (
@@ -35,174 +37,281 @@ type command struct {
 
 // Store is a simple key-value store, where all changes are made via Raft consensus.
 type Store struct {
-	RaftDir  string
-	RaftBind string
-	inmem    bool
+    RaftDir  string
+    RaftBind string
+    inmem    bool
 
-	mu sync.Mutex
-	m  map[string]string // The key-value store for the system.
+    nodeID string
 
-	raft *raft.Raft // The consensus mechanism
-
-	logger *log.Logger
+    mu         sync.Mutex
+    raftMap    map[string]*raft.Raft
+    fsmMap     map[string]*fsm  
+    hashRing   *consistenthash.HashRing
+    logger     *log.Logger
 }
 
 // New returns a new Store.
-func New(inmem bool) *Store {
-	return &Store{
-		m:      make(map[string]string),
-		inmem:  inmem,
-		logger: log.New(os.Stderr, "[store] ", log.LstdFlags),
-	}
+func New(nodeID string, inmem bool) *Store {
+    return &Store{
+        inmem:     inmem,
+        nodeID:    nodeID,
+        raftMap:   make(map[string]*raft.Raft),
+        fsmMap:    make(map[string]*fsm),
+        hashRing:  consistenthash.NewHashRing(3), //change to change number of replicas
+        logger:    log.New(os.Stderr, "[store] ", log.LstdFlags),
+    }
 }
 
 // Open opens the store. If enableSingle is set, and there are no existing peers,
 // then this node becomes the first node, and therefore leader, of the cluster.
 // localID should be the server identifier for this node.
-func (s *Store) Open(enableSingle bool, localID string) error {
-	// Setup Raft configuration.
-	config := raft.DefaultConfig()
-	config.LocalID = raft.ServerID(localID)
+func (s *Store) Open(enableSingle bool, localID string, shardIDs []string) error {
+    s.logger.Printf("Opening store with shards: %v", shardIDs)
+    for i, shardID := range shardIDs {
+        raftDir := filepath.Join(s.RaftDir, shardID)
+        if err := os.MkdirAll(raftDir, 0700); err != nil {
+            return fmt.Errorf("failed to create Raft directory for shard %s: %v", shardID, err)
+        }
 
-	// Setup Raft communication.
-	addr, err := net.ResolveTCPAddr("tcp", s.RaftBind)
-	if err != nil {
-		return err
-	}
-	transport, err := raft.NewTCPTransport(s.RaftBind, addr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		return err
-	}
+        // unique RaftBind by incrementing the port
+        raftBindPerShard, err := incrementPort(s.RaftBind, i)
+        if err != nil {
+            return fmt.Errorf("failed to generate raft bind address per shard: %v", err)
+        }
 
-	// Create the snapshot store. This allows the Raft to truncate the log.
-	snapshots, err := raft.NewFileSnapshotStore(s.RaftDir, retainSnapshotCount, os.Stderr)
-	if err != nil {
-		return fmt.Errorf("file snapshot store: %s", err)
-	}
+        // Initialize Raft for this shard
+        ra, err := s.setupRaft(raftDir, raftBindPerShard, enableSingle, localID+"-"+shardID, shardID)
+        if err != nil {
+            return fmt.Errorf("failed to set up Raft for shard %s: %v", shardID, err)
+        }
+        s.raftMap[shardID] = ra
 
-	// Create the log store and stable store.
-	var logStore raft.LogStore
-	var stableStore raft.StableStore
-	if s.inmem {
-		logStore = raft.NewInmemStore()
-		stableStore = raft.NewInmemStore()
-	} else {
-		boltDB, err := raftboltdb.New(raftboltdb.Options{
-			Path: filepath.Join(s.RaftDir, "raft.db"),
-		})
-		if err != nil {
-			return fmt.Errorf("new bbolt store: %s", err)
-		}
-		logStore = boltDB
-		stableStore = boltDB
-	}
+        s.hashRing.AddNode(consistenthash.Node{
+            ID:   shardID,
+            Addr: raftBindPerShard,
+        })
+    }
+    return nil
+}
 
-	// Instantiate the Raft systems.
-	ra, err := raft.NewRaft(config, (*fsm)(s), logStore, stableStore, snapshots, transport)
-	if err != nil {
-		return fmt.Errorf("new raft: %s", err)
-	}
-	s.raft = ra
+func (s *Store) setupRaft(raftDir, raftBind string, enableSingle bool, localID, shardID string) (*raft.Raft, error) {
+    // Setup Raft configuration.
+    config := raft.DefaultConfig()
+    config.LocalID = raft.ServerID(localID)
 
-	if enableSingle {
-		configuration := raft.Configuration{
-			Servers: []raft.Server{
-				{
-					ID:      config.LocalID,
-					Address: transport.LocalAddr(),
-				},
-			},
-		}
-		ra.BootstrapCluster(configuration)
-	}
+    // Setup Raft communication.
+    addr, err := net.ResolveTCPAddr("tcp", raftBind)
+    if err != nil {
+        return nil, err
+    }
+    transport, err := raft.NewTCPTransport(raftBind, addr, 3, 10*time.Second, os.Stderr)
+    if err != nil {
+        return nil, err
+    }
 
-	return nil
+    // Create the snapshot store. This allows the Raft to truncate the log.
+    snapshots, err := raft.NewFileSnapshotStore(raftDir, retainSnapshotCount, os.Stderr)
+    if err != nil {
+        return nil, fmt.Errorf("file snapshot store: %s", err)
+    }
+
+    // Create the log store and stable store.
+    var logStore raft.LogStore
+    var stableStore raft.StableStore
+    if s.inmem {
+        logStore = raft.NewInmemStore()
+        stableStore = raft.NewInmemStore()
+    } else {
+        boltDB, err := raftboltdb.New(raftboltdb.Options{
+            Path: filepath.Join(raftDir, "raft.db"),
+        })
+        if err != nil {
+            return nil, fmt.Errorf("new bolt store: %s", err)
+        }
+        logStore = boltDB
+        stableStore = boltDB
+    }
+
+    // Instantiate the Raft systems.
+    fsm := newFSM()
+    ra, err := raft.NewRaft(config, fsm, logStore, stableStore, snapshots, transport)
+    if err != nil {
+        return nil, fmt.Errorf("new raft: %s", err)
+    }
+
+    s.fsmMap[shardID] = fsm
+
+    if enableSingle {
+        configuration := raft.Configuration{
+            Servers: []raft.Server{
+                {
+                    ID:      config.LocalID,
+                    Address: transport.LocalAddr(),
+                },
+            },
+        }
+        ra.BootstrapCluster(configuration)
+    }
+
+    return ra, nil
+}
+
+func incrementPort(raftBind string, offset int) (string, error) {
+    host, portStr, err := net.SplitHostPort(raftBind)
+    if err != nil {
+        return "", err
+    }
+    port, err := strconv.Atoi(portStr)
+    if err != nil {
+        return "", err
+    }
+    newPort := port + offset
+    return net.JoinHostPort(host, strconv.Itoa(newPort)), nil
 }
 
 // Get returns the value for the given key.
 func (s *Store) Get(key string) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.m[key], nil
+    shardID := s.hashRing.GetNode(key).ID
+    s.mu.Lock()
+    fsm, ok := s.fsmMap[shardID]
+    s.mu.Unlock()
+    if !ok {
+        return "", fmt.Errorf("no FSM for shard %s", shardID)
+    }
+
+    fsm.mu.Lock()
+    defer fsm.mu.Unlock()
+    value := fsm.m[key]
+    return value, nil
 }
 
 // Set sets the value for the given key.
 func (s *Store) Set(key, value string) error {
-	if s.raft.State() != raft.Leader {
-		return fmt.Errorf("not leader")
-	}
+    shardID := s.hashRing.GetNode(key).ID
+    ra, ok := s.raftMap[shardID]
+    if !ok {
+        return fmt.Errorf("no Raft instance for shard %s", shardID)
+    }
 
-	c := &command{
-		Op:    "set",
-		Key:   key,
-		Value: value,
-	}
-	b, err := json.Marshal(c)
-	if err != nil {
-		return err
-	}
+    if ra.State() != raft.Leader {
+        return fmt.Errorf("not leader")
+    }
 
-	f := s.raft.Apply(b, raftTimeout)
-	return f.Error()
+    c := &command{
+        Op:    "set",
+        Key:   key,
+        Value: value,
+    }
+    b, err := json.Marshal(c)
+    if err != nil {
+        return err
+    }
+
+    f := ra.Apply(b, raftTimeout)
+    return f.Error()
 }
 
 // Delete deletes the given key.
 func (s *Store) Delete(key string) error {
-	if s.raft.State() != raft.Leader {
-		return fmt.Errorf("not leader")
-	}
+    shardID := s.hashRing.GetNode(key).ID
+    ra, ok := s.raftMap[shardID]
+    if !ok {
+        return fmt.Errorf("no Raft instance for shard %s", shardID)
+    }
 
-	c := &command{
-		Op:  "delete",
-		Key: key,
-	}
-	b, err := json.Marshal(c)
-	if err != nil {
-		return err
-	}
+    if ra.State() != raft.Leader {
+        return fmt.Errorf("not leader")
+    }
 
-	f := s.raft.Apply(b, raftTimeout)
-	return f.Error()
+    c := &command{
+        Op:  "delete",
+        Key: key,
+    }
+    b, err := json.Marshal(c)
+    if err != nil {
+        return err
+    }
+
+    f := ra.Apply(b, raftTimeout)
+    return f.Error()
 }
 
-// Join joins a node, identified by nodeID and located at addr, to this store.
-// The node must be ready to respond to Raft communications at that address.
-func (s *Store) Join(nodeID, addr string) error {
-	s.logger.Printf("received join request for remote node %s at %s", nodeID, addr)
+// Join joins a node to the cluster for the given shards.
+func (s *Store) Join(nodeID, addr string, shardIDs []string) error {
+    s.logger.Printf("received join request for node %s at %s with shards %v", nodeID, addr, shardIDs)
 
-	configFuture := s.raft.GetConfiguration()
-	if err := configFuture.Error(); err != nil {
-		s.logger.Printf("failed to get raft configuration: %v", err)
-		return err
-	}
+    for i, shardID := range shardIDs {
+        ra, ok := s.raftMap[shardID]
+        if !ok {
+            // Node doesn't have this shard; initialize Raft for it.
+            raftDir := filepath.Join(s.RaftDir, shardID)
+            if err := os.MkdirAll(raftDir, 0700); err != nil {
+                return fmt.Errorf("failed to create Raft directory for shard %s: %v", shardID, err)
+            }
 
-	for _, srv := range configFuture.Configuration().Servers {
-		// If a node already exists with either the joining node's ID or address,
-		// that node may need to be removed from the config first.
-		if srv.ID == raft.ServerID(nodeID) || srv.Address == raft.ServerAddress(addr) {
-			// However if *both* the ID and the address are the same, then nothing -- not even
-			// a join operation -- is needed.
-			if srv.Address == raft.ServerAddress(addr) && srv.ID == raft.ServerID(nodeID) {
-				s.logger.Printf("node %s at %s already member of cluster, ignoring join request", nodeID, addr)
-				return nil
-			}
+            raftBindPerShard, err := incrementPort(s.RaftBind, i)
+            if err != nil {
+                return fmt.Errorf("failed to generate raft bind address per shard: %v", err)
+            }
 
-			future := s.raft.RemoveServer(srv.ID, 0, 0)
-			if err := future.Error(); err != nil {
-				return fmt.Errorf("error removing existing node %s at %s: %s", nodeID, addr, err)
-			}
-		}
-	}
+            ra, err := s.setupRaft(raftDir, raftBindPerShard, false, nodeID+"-"+shardID, shardID)
+            if err != nil {
+                return fmt.Errorf("failed to set up Raft for shard %s: %v", shardID, err)
+            }
+            s.raftMap[shardID] = ra
+        }
 
-	f := s.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, 0)
-	if f.Error() != nil {
-		return f.Error()
-	}
-	s.logger.Printf("node %s at %s joined successfully", nodeID, addr)
-	return nil
+        // Join the Raft cluster for this shard
+        raftBindPerShard, err := incrementPort(addr, i)
+        if err != nil {
+            return fmt.Errorf("failed to generate raft bind address per shard: %v", err)
+        }
+
+        if err := s.joinRaftCluster(ra, nodeID+"-"+shardID, raftBindPerShard); err != nil {
+            return err
+        }
+    }
+    return nil
 }
 
-type fsm Store
+func (s *Store) joinRaftCluster(ra *raft.Raft, nodeID, addr string) error {
+    configFuture := ra.GetConfiguration()
+    if err := configFuture.Error(); err != nil {
+        return err
+    }
+
+    for _, srv := range configFuture.Configuration().Servers {
+        if srv.ID == raft.ServerID(nodeID) || srv.Address == raft.ServerAddress(addr) {
+            if srv.Address == raft.ServerAddress(addr) && srv.ID == raft.ServerID(nodeID) {
+                s.logger.Printf("node %s at %s already member of cluster, ignoring join request", nodeID, addr)
+                return nil
+            }
+
+            future := ra.RemoveServer(srv.ID, 0, 0)
+            if err := future.Error(); err != nil {
+                return fmt.Errorf("error removing existing node %s at %s: %s", nodeID, addr, err)
+            }
+        }
+    }
+
+    f := ra.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, 0)
+    if f.Error() != nil {
+        return f.Error()
+    }
+    s.logger.Printf("node %s at %s joined successfully", nodeID, addr)
+    return nil
+}
+
+type fsm struct {
+    mu sync.Mutex
+    m  map[string]string
+}
+
+func newFSM() *fsm {
+    return &fsm{
+        m: make(map[string]string),
+    }
+}
 
 // Apply applies a Raft log entry to the key-value store.
 func (f *fsm) Apply(l *raft.Log) interface{} {
